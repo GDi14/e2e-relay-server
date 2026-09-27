@@ -20,11 +20,6 @@ const requiredEnv = [
   "PORT",
   "DATABASE_URL",
   "INVITE_CODES",
-  "S3_ENDPOINT",
-  "S3_REGION",
-  "S3_BUCKET",
-  "S3_ACCESS_KEY_ID",
-  "S3_SECRET_ACCESS_KEY",
 ] as const;
 
 function requireEnvironment(): void {
@@ -78,18 +73,24 @@ CREATE INDEX IF NOT EXISTS relay_messages_recipient_created_idx
 
 const app = Fastify({ logger: false, bodyLimit: 1_048_576 });
 const pool = new Pool({ connectionString: process.env.DATABASE_URL });
-const s3 = new S3Client({
-  region: process.env.S3_REGION,
-  endpoint: process.env.S3_ENDPOINT,
-  forcePathStyle: true,
-  credentials: {
-    accessKeyId: process.env.S3_ACCESS_KEY_ID!,
-    secretAccessKey: process.env.S3_SECRET_ACCESS_KEY!,
-  },
-});
-const bucket = process.env.S3_BUCKET!;
 const mediaUrlTtl = Number(process.env.MEDIA_URL_TTL_SECONDS ?? "900");
 const sockets = new Map<string, Set<WebSocket>>();
+
+function getMediaStorage(): { client: S3Client; bucket: string } | undefined {
+  const { S3_ENDPOINT, S3_REGION, S3_BUCKET, S3_ACCESS_KEY_ID, S3_SECRET_ACCESS_KEY } = process.env;
+  if (!S3_ENDPOINT || !S3_REGION || !S3_BUCKET || !S3_ACCESS_KEY_ID || !S3_SECRET_ACCESS_KEY) {
+    return undefined;
+  }
+  return {
+    client: new S3Client({
+      region: S3_REGION,
+      endpoint: S3_ENDPOINT,
+      forcePathStyle: true,
+      credentials: { accessKeyId: S3_ACCESS_KEY_ID, secretAccessKey: S3_SECRET_ACCESS_KEY },
+    }),
+    bucket: S3_BUCKET,
+  };
+}
 
 app.setErrorHandler((error: Error & { statusCode?: number }, _request: FastifyRequest, reply: FastifyReply) => {
   const status = error.statusCode && error.statusCode >= 400 && error.statusCode < 500 ? error.statusCode : 500;
@@ -174,26 +175,34 @@ app.put<{ Params: { userId: string }; Body: unknown }>("/v1/users/:userId/keys",
 });
 
 app.post("/v1/media/upload-url", async (_request, reply) => {
+  const storage = getMediaStorage();
+  if (!storage) return reply.code(503).send({ error: "Media storage is not configured" });
   const mediaId = randomUUID();
   try {
-    const url = await getSignedUrl(s3, new PutObjectCommand({ Bucket: bucket, Key: mediaId }), {
+    const url = await getSignedUrl(storage.client, new PutObjectCommand({ Bucket: storage.bucket, Key: mediaId }), {
       expiresIn: mediaUrlTtl,
     });
     return reply.code(201).send({ mediaId, url, expiresIn: mediaUrlTtl });
   } catch {
     return reply.code(503).send({ error: "Media storage is unavailable" });
+  } finally {
+    storage.client.destroy();
   }
 });
 
 app.get<{ Params: { mediaId: string } }>("/v1/media/:mediaId/download-url", async (request, reply) => {
   if (!isUuid(request.params.mediaId)) return badRequest(reply, "Invalid media ID");
+  const storage = getMediaStorage();
+  if (!storage) return reply.code(503).send({ error: "Media storage is not configured" });
   try {
-    const url = await getSignedUrl(s3, new GetObjectCommand({ Bucket: bucket, Key: request.params.mediaId }), {
+    const url = await getSignedUrl(storage.client, new GetObjectCommand({ Bucket: storage.bucket, Key: request.params.mediaId }), {
       expiresIn: mediaUrlTtl,
     });
     return reply.send({ url, expiresIn: mediaUrlTtl });
   } catch {
     return reply.code(503).send({ error: "Media storage is unavailable" });
+  } finally {
+    storage.client.destroy();
   }
 });
 
@@ -328,8 +337,11 @@ async function start(): Promise<void> {
   if (!Number.isInteger(mediaUrlTtl) || mediaUrlTtl < 1 || mediaUrlTtl > 604800) {
     throw new Error("MEDIA_URL_TTL_SECONDS must be an integer between 1 and 604800");
   }
+  startupStage = "database-schema";
   await pool.query(schema);
+  startupStage = "invite-code-sync";
   await addInviteCodes();
+  startupStage = "http-listen";
   await app.listen({ port: Number(process.env.PORT), host: "0.0.0.0" });
 
   const websocketServer = new WebSocketServer({ server: app.server, path: "/v1/relay", maxPayload: 1_048_576 });
@@ -356,8 +368,28 @@ async function start(): Promise<void> {
   });
 }
 
-start().catch(() => {
-  process.stderr.write("Relay server startup failed. Check configuration and database availability.\n");
+function safeStartupError(error: unknown): string {
+  if (error instanceof Error && error.message.startsWith("Missing required environment variables:")) {
+    return error.message;
+  }
+  if (error instanceof Error && error.message === "PORT must be an integer between 1 and 65535") {
+    return error.message;
+  }
+  if (error instanceof Error && error.message === "INVITE_CODES must contain at least one code") {
+    return error.message;
+  }
+  if (error instanceof Error && error.message === "MEDIA_URL_TTL_SECONDS must be an integer between 1 and 604800") {
+    return error.message;
+  }
+  const code = isRecord(error) && typeof error.code === "string" && /^[A-Za-z0-9_-]{1,32}$/.test(error.code)
+    ? error.code
+    : undefined;
+  return code ? `error_code=${code}` : "error_code=unavailable";
+}
+
+let startupStage = "configuration";
+start().catch((error: unknown) => {
+  process.stderr.write(`Relay startup failed at stage=${startupStage}: ${safeStartupError(error)}\n`);
   process.exitCode = 1;
 });
 
@@ -365,7 +397,6 @@ for (const signal of ["SIGINT", "SIGTERM"] as const) {
   process.on(signal, () => {
     void app.close().finally(async () => {
       await pool.end();
-      s3.destroy();
     });
   });
 }

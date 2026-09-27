@@ -22,12 +22,13 @@ On startup, the service creates its tables and inserts hashes of the configured 
 - `PORT` (required): TCP port to listen on; supplied by Railway.
 - `DATABASE_URL` (required): PostgreSQL connection string.
 - `INVITE_CODES` (required): comma-separated initial invite codes. Codes are hashed before storage.
-- `S3_ENDPOINT` (required): S3-compatible endpoint, such as the Cloudflare R2 account endpoint.
-- `S3_REGION` (required): storage region (`auto` for Cloudflare R2).
-- `S3_BUCKET` (required): bucket for encrypted media.
-- `S3_ACCESS_KEY_ID` (required): S3-compatible access key.
-- `S3_SECRET_ACCESS_KEY` (required): S3-compatible secret key.
-- `MEDIA_URL_TTL_SECONDS` (optional, default `900`): presigned URL lifetime, from 1 to 604800 seconds.
+ `S3_ENDPOINT` (required for media URLs): S3-compatible endpoint, such as the Cloudflare R2 account endpoint. Media configuration is lazy and does not prevent relay startup.
+ `S3_REGION` (required for media URLs): storage region (`auto` for Cloudflare R2).
+ `S3_BUCKET` (required for media URLs): bucket for encrypted media.
+ `S3_ACCESS_KEY_ID` (required for media URLs): S3-compatible access key.
+ `S3_SECRET_ACCESS_KEY` (required for media URLs): S3-compatible secret key.
+
+Only `PORT`, `DATABASE_URL`, and `INVITE_CODES` are required for startup. If storage configuration is incomplete, the server stays online and media URL endpoints return `503` until all five `S3_*` settings are supplied. If startup fails, Railway logs identify the failing stage and a sanitized error code without printing credentials or message/key contents.
 
 ## Deployment and limitations
 
